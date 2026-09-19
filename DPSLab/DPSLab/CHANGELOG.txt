@@ -1,0 +1,75 @@
+DPSLab v0.6.0-alpha
+===================
+- Added Gaia-inspired dark teal / gold styling to the main window and HUD.
+- Damage tab now shows hits, attempts, and accuracy for melee, ranged, and weaponskills.
+- Added Group Acc column using melee + ranged hit rate to match Live Accuracy.
+- Added skillchain detection from 0x028 additional-effect messages.
+- Added separate solo, shared, and unresolved skillchain buckets.
+- Solo/self-created WS skillchains are credited to the player's Total / DPS.
+- Shared skillchains are kept outside individual player totals and shown as a separate Group row.
+- Unresolved skillchains are preserved separately rather than guessed.
+- Added SC information to the Live event feed, compact HUD, ParserLogs, Compare, and benchmark History.
+- Added Live-vs-Group self diagnostic with damage, DPS, active-time, and capture-window deltas.
+- Aligned Live and Group DPS timing by preventing incoming damage and support-only actions from extending only the Live active-time denominator.
+- Retains all v0.5.2 Compare / History / safe A-B switching behavior.
+
+DPSLab v0.5.2-alpha
+===================
+- Added Reset Compare button to clear loaded/frozen A and B comparison slots without affecting History.
+- History now shows persistent confirmation when a selected run is loaded into Compare A or B.
+- History now displays the currently loaded Compare A and Compare B run names.
+- Starting Test A or Test B while another benchmark is recording now stops, freezes, saves, and writes the active run to History before starting the requested side.
+- Added Delete Selected for History with an inline Confirm Delete / Cancel Delete safety step.
+- Deleting a History run rewrites History/benchmarks.tsv while preserving all remaining runs.
+- Retains the v0.5.1 history_clean/string.gsub multiple-return crash fix.
+
+v0.5.1
+- Fixed Stop Test / history-save crash caused by Lua multiple-return behavior from string.gsub in history_clean().
+- history_clean() now forces a single return value before table.insert().
+
+DPSLab v0.5.0-alpha
+===================
+- Live and Group are now independent capture domains.
+- Both Live and Group default to CAPTURING on addon load.
+- Added Start / Stop / Reset controls for Live.
+- Added Start / Stop / Reset controls for Group, including requested Reset Group.
+- Stopped capture clocks now freeze instead of accumulating paused wall time.
+- Test Lab no longer uses top-level equipment-set names as its primary source.
+- Added active LuAshitacast HandleCommand(args) scanning.
+- Discovers two-level `/lac fwd <group> <option>` families.
+- Supports Gaia-style mode tables such as shotModes = { Normal, Accuracy, Attack }.
+- Test A/B dropdowns are filtered to options under the selected command family.
+- Starting A/B automatically issues the expected discovered `/lac fwd` command.
+- Added Manual / Custom Test mode with friendly A/B names and optional commands.
+- Added Capture Scope (Auto / Melee-TP / Ranged / WS / All).
+- Added actual worn-equipment sampling during matching self actions.
+- Added optional first-enemy target lock with off-target exclusion/warning.
+- Added Manual / Seconds / Melee Rounds / WS Count benchmark stop rules.
+- Completed Test A and Test B are now frozen run objects.
+- Compare is now implemented and intentionally solo/local-player only.
+- Compare includes DPS, TP rates, accuracy, damage buckets, WS stats, deltas, and observed gear differences.
+- Added persistent benchmark History in History/benchmarks.tsv.
+- History uses compact date/time | job/sub | test name | duration rows.
+- Historical runs can be loaded into Compare as A or B.
+- ParserLogs behavior is retained.
+
+DPSLab v0.4.0-alpha
+===================
+- Added party/alliance Group parser.
+- Added Melee / Range / Magic / Ability / Proc / WS / TP/s / Total / DPS columns.
+- Added observed per-member TP/s with TP-cap censoring.
+- Retained active-combat Live instrumentation and ParserLogs.
+
+DPSLab v0.3.1-alpha
+===================
+- Fixed support/status spell values being misclassified as damage.
+- Switched damage classification toward action-message-aware handling.
+
+DPSLab v0.3.0-alpha
+===================
+- Added active-combat timing instead of first-action-to-last-action wall span.
+- Added incoming TP classification.
+- Added TP-cap censoring.
+- Added pre-WS TP snapshot from outgoing WS action.
+- Added ParserLogs optional local CSV event feed.
+- Renamed raw event time column to Elapsed.
