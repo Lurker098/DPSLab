@@ -1,7 +1,7 @@
 addon.name      = 'dpslab';
 addon.author    = 'OpenAI / Gaia DPSLab project';
-addon.version   = '0.5.2-alpha';
-addon.desc      = 'DPS / TP instrumentation with independent Live/Group capture, command-driven LuAshitacast A/B testing, comparison, and persistent benchmark history for Ashita v4.';
+addon.version   = '0.6.0-alpha';
+addon.desc      = 'Gaia-themed DPS / TP instrumentation with skillchain attribution, accuracy breakdowns, A/B testing, comparison, and persistent benchmark history for Ashita v4.';
 addon.link      = '';
 
 require('common');
@@ -96,6 +96,10 @@ state = {
     recent_signatures = {},
     tp_candidates = {},
     pending_ws = nil,
+    skillchain = {
+        last_ws_by_target = {},
+        infer_window = 10.0,
+    },
 
     settings = addon_settings,
     clock = {
@@ -123,6 +127,8 @@ state = {
         last_poll = 0,
         refresh_interval = 0.50,
         poll_interval = 0.10,
+        shared_sc_damage = 0,
+        unknown_sc_damage = 0,
     },
 
     debug = {
@@ -164,16 +170,63 @@ local test_scope_combo = 'Auto\0Melee / TP\0Ranged\0WS\0All\0\0';
 local STOP_MODES = { 'Manual', 'Seconds', 'Melee Rounds', 'WS Count' };
 local stop_mode_combo = 'Manual\0Seconds\0Melee Rounds\0WS Count\0\0';
 
+-- Gaia-inspired UI palette.  Kept local to DPSLab so it does not alter the user's
+-- global Ashita / ImGui theme.  Colors are intentionally high-contrast on FFXI's UI.
+local GAIA = {
+    gold = { 0.93, 0.76, 0.28, 1.00 },
+    teal = { 0.24, 0.78, 0.70, 1.00 },
+    green = { 0.43, 0.88, 0.55, 1.00 },
+    red = { 0.95, 0.38, 0.34, 1.00 },
+    muted = { 0.62, 0.68, 0.69, 1.00 },
+    window = { 0.045, 0.065, 0.070, 0.97 },
+    child = { 0.060, 0.085, 0.090, 0.96 },
+    frame = { 0.090, 0.170, 0.170, 1.00 },
+    frame_hover = { 0.120, 0.255, 0.245, 1.00 },
+    frame_active = { 0.160, 0.340, 0.310, 1.00 },
+    button = { 0.080, 0.285, 0.265, 1.00 },
+    button_hover = { 0.110, 0.410, 0.365, 1.00 },
+    button_active = { 0.145, 0.515, 0.440, 1.00 },
+    header_bg = { 0.105, 0.285, 0.270, 1.00 },
+    header_hover = { 0.135, 0.390, 0.350, 1.00 },
+    header_active = { 0.165, 0.485, 0.415, 1.00 },
+    separator = { 0.34, 0.42, 0.40, 0.78 },
+    table_header = { 0.080, 0.210, 0.205, 1.00 },
+};
+
+local function push_gaia_theme()
+    imgui.PushStyleColor(ImGuiCol_WindowBg, GAIA.window);
+    imgui.PushStyleColor(ImGuiCol_ChildBg, GAIA.child);
+    imgui.PushStyleColor(ImGuiCol_FrameBg, GAIA.frame);
+    imgui.PushStyleColor(ImGuiCol_FrameBgHovered, GAIA.frame_hover);
+    imgui.PushStyleColor(ImGuiCol_FrameBgActive, GAIA.frame_active);
+    imgui.PushStyleColor(ImGuiCol_Button, GAIA.button);
+    imgui.PushStyleColor(ImGuiCol_ButtonHovered, GAIA.button_hover);
+    imgui.PushStyleColor(ImGuiCol_ButtonActive, GAIA.button_active);
+    imgui.PushStyleColor(ImGuiCol_Header, GAIA.header_bg);
+    imgui.PushStyleColor(ImGuiCol_HeaderHovered, GAIA.header_hover);
+    imgui.PushStyleColor(ImGuiCol_HeaderActive, GAIA.header_active);
+    imgui.PushStyleColor(ImGuiCol_Separator, GAIA.separator);
+    imgui.PushStyleColor(ImGuiCol_TableHeaderBg, GAIA.table_header);
+end
+
+local function pop_gaia_theme()
+    imgui.PopStyleColor(13);
+end
+
 local function header(text)
-    imgui.TextColored({ 0.95, 0.75, 0.20, 1.00 }, text);
+    imgui.TextColored(GAIA.gold, text);
 end
 
 local function good(text)
-    imgui.TextColored({ 0.40, 0.95, 0.40, 1.00 }, text);
+    imgui.TextColored(GAIA.green, text);
 end
 
 local function warn(text)
-    imgui.TextColored({ 0.95, 0.65, 0.20, 1.00 }, text);
+    imgui.TextColored(GAIA.gold, text);
+end
+
+local function muted(text)
+    imgui.TextColored(GAIA.muted, text);
 end
 
 local function row3(a, b, c)
@@ -368,6 +421,29 @@ local ADDITIONAL_DAMAGE_MESSAGES = {
     [229]=true, -- Additional effect: additional damage.
 };
 
+-- Skillchains are transmitted in the additional-effect portion of 0x028.
+-- 288-301 are the classic SC result messages; 385-398 are alternate message
+-- variants seen by clients; 767-770 cover Radiance / Umbra variants.
+local SKILLCHAIN_MESSAGES = {
+    [288]='Light', [289]='Darkness', [290]='Gravitation', [291]='Fragmentation',
+    [292]='Distortion', [293]='Fusion', [294]='Compression', [295]='Liquefaction',
+    [296]='Induration', [297]='Reverberation', [298]='Transfixion', [299]='Scission',
+    [300]='Detonation', [301]='Impaction',
+    [385]='Light', [386]='Darkness', [387]='Gravitation', [388]='Fragmentation',
+    [389]='Distortion', [390]='Fusion', [391]='Compression', [392]='Liquefaction',
+    [393]='Induration', [394]='Reverberation', [395]='Transfixion', [396]='Scission',
+    [397]='Detonation', [398]='Impaction',
+    [767]='Radiance', [768]='Umbra', [769]='Radiance', [770]='Umbra',
+};
+
+local function result_skillchain(result)
+    if not result or not result.has_add_effect then return nil, 0; end
+    local name = SKILLCHAIN_MESSAGES[result.add_message or -1];
+    local damage = tonumber(result.add_value) or 0;
+    if name and damage > 0 then return name, damage; end
+    return nil, 0;
+end
+
 local function result_is_damage(category, result)
     if not result then return false; end
     -- Auto-attacks and completed ranged attacks carry HP damage directly when they land.
@@ -379,6 +455,75 @@ end
 
 local function additional_is_damage(result)
     return result and result.has_add_effect and ADDITIONAL_DAMAGE_MESSAGES[result.add_message or -1] == true;
+end
+
+-- The closing 0x028 packet tells us the SC result and damage, but not the opener.
+-- For WS-driven chains we infer ownership from the immediately preceding landed WS
+-- on the same target.  Unknown is preserved rather than guessed when confidence is low.
+local function classify_skillchains(action)
+    local events = {};
+    local t = now();
+    for _, target in ipairs(action.targets or {}) do
+        local previous = state.skillchain.last_ws_by_target[target.id];
+        for _, result in ipairs(target.actions or {}) do
+            local name, damage = result_skillchain(result);
+            if name then
+                local ownership = 'unknown';
+                local opener_actor_id = 0;
+                if previous and (t - (previous.clock or 0)) >= 0 and (t - (previous.clock or 0)) <= (state.skillchain.infer_window or 10.0) then
+                    opener_actor_id = previous.actor_id or 0;
+                    ownership = opener_actor_id == action.actor_id and 'solo' or 'shared';
+                end
+                table.insert(events, {
+                    target_id = target.id,
+                    name = name,
+                    damage = damage,
+                    ownership = ownership,
+                    opener_actor_id = opener_actor_id,
+                });
+            end
+        end
+    end
+    return events;
+end
+
+local function update_skillchain_tracker(action)
+    -- Deliberately conservative for now: classic weapon-skill chains are reliable.
+    -- Magic / pet-created chains remain visible, but may be marked unknown rather than
+    -- being incorrectly assigned to a player.
+    if not action or action.category ~= 3 then return; end
+    local t = now();
+    for _, target in ipairs(action.targets or {}) do
+        local landed = false;
+        for _, result in ipairs(target.actions or {}) do
+            if result.reaction == 0 and result_is_damage(3, result) and (result.value or 0) > 0 then
+                landed = true;
+                break;
+            end
+        end
+        if landed then
+            state.skillchain.last_ws_by_target[target.id] = {
+                actor_id = action.actor_id,
+                clock = t,
+            };
+        end
+    end
+end
+
+local function skillchain_totals(action)
+    local total, solo, shared, unknown = 0, 0, 0, 0;
+    local labels = {};
+    local seen = {};
+    for _, sc in ipairs(action.skillchains or {}) do
+        local damage = tonumber(sc.damage) or 0;
+        total = total + damage;
+        if sc.ownership == 'solo' then solo = solo + damage;
+        elseif sc.ownership == 'shared' then shared = shared + damage;
+        else unknown = unknown + damage; end
+        local label = string.format('%s %d (%s)', sc.name or 'SC', damage, sc.ownership or 'unknown');
+        if not seen[label] then table.insert(labels, label); seen[label] = true; end
+    end
+    return total, solo, shared, unknown, table.concat(labels, ', ');
 end
 
 local function new_group_member(id, name, slot, job, tp)
@@ -396,8 +541,15 @@ local function new_group_member(id, name, slot, job, tp)
         ability = 0,
         proc = 0,
         ws = 0,
+        skillchain = 0, -- Solo/self-created SC only; shared SC is kept at group level.
         total = 0,
 
+        melee_attempts = 0,
+        melee_hits = 0,
+        ranged_attempts = 0,
+        ranged_hits = 0,
+        ws_attempts = 0,
+        ws_hits = 0,
         action_count = 0,
         active_seconds = 0,
         tp_observable_seconds = 0,
@@ -483,6 +635,20 @@ local function group_member_tpps(member)
     return (member.tp_positive or 0) / member.tp_observable_seconds;
 end
 
+local function percent(hits, attempts)
+    hits = tonumber(hits) or 0;
+    attempts = tonumber(attempts) or 0;
+    if attempts <= 0 then return nil; end
+    return (hits / attempts) * 100;
+end
+
+local function group_member_accuracy(member)
+    if not member then return nil; end
+    -- Keep this aligned with Live Accuracy: melee + ranged only.
+    return percent((member.melee_hits or 0) + (member.ranged_hits or 0),
+        (member.melee_attempts or 0) + (member.ranged_attempts or 0));
+end
+
 local function poll_group_tp(force)
     refresh_group_members(false);
     local t = now();
@@ -530,23 +696,35 @@ local function record_group_action(action)
 
     local damage = 0;
     local proc_damage = 0;
+    local attempts = 0;
+    local hits = 0;
     for _, target in ipairs(action.targets) do
         for _, r in ipairs(target.actions) do
+            attempts = attempts + 1;
             if result_is_damage(category, r) then
                 damage = damage + (r.value or 0);
             end
+            if r.reaction == 0 then hits = hits + 1; end
             if additional_is_damage(r) and (r.add_value or 0) > 0 then
                 proc_damage = proc_damage + r.add_value;
             end
         end
     end
 
+    local _, solo_sc, shared_sc, unknown_sc = skillchain_totals(action);
+
     if category == 1 then
         member.melee = member.melee + damage;
+        member.melee_attempts = member.melee_attempts + attempts;
+        member.melee_hits = member.melee_hits + hits;
     elseif category == 2 then
         member.ranged = member.ranged + damage;
+        member.ranged_attempts = member.ranged_attempts + attempts;
+        member.ranged_hits = member.ranged_hits + hits;
     elseif category == 3 then
         member.ws = member.ws + damage;
+        member.ws_attempts = member.ws_attempts + attempts;
+        member.ws_hits = member.ws_hits + hits;
     elseif category == 4 then
         member.magic = member.magic + damage;
     elseif category == 6 or category == 14 or category == 15 then
@@ -554,14 +732,16 @@ local function record_group_action(action)
     end
 
     member.proc = member.proc + proc_damage;
-    member.total = member.melee + member.ranged + member.magic + member.ability + member.proc + member.ws;
+    member.skillchain = member.skillchain + solo_sc;
+    state.group.shared_sc_damage = (state.group.shared_sc_damage or 0) + shared_sc;
+    state.group.unknown_sc_damage = (state.group.unknown_sc_damage or 0) + unknown_sc;
+    member.total = member.melee + member.ranged + member.magic + member.ability + member.proc + member.ws + member.skillchain;
     member.action_count = member.action_count + 1;
     state.debug.group_action_packets = state.debug.group_action_packets + 1;
 
-    -- Auto attacks, ranged attacks and WS attempts keep the player active even on a miss.
-    -- Magic/ability actions only extend active time when they actually dealt damage/proc damage,
-    -- preventing support buff spam from inflating a DPS denominator.
-    if category == 1 or category == 2 or category == 3 or damage > 0 or proc_damage > 0 then
+    -- Keep the Group self row on the same offensive active-time model as Live:
+    -- attack / ranged / WS attempts always count; support actions only count if they dealt damage.
+    if category == 1 or category == 2 or category == 3 or damage > 0 or proc_damage > 0 or solo_sc > 0 or shared_sc > 0 or unknown_sc > 0 then
         mark_group_activity(member, now());
     end
     return true;
@@ -650,7 +830,7 @@ local function open_log()
     end
     state.log.file = file;
     state.log.lines = 0;
-    file:write('event_id,local_time,elapsed,type,action,target_or_source,hits,attempts,damage,additional,tp_before,tp_after,tp_delta,tp_class,note\n');
+    file:write('event_id,local_time,elapsed,type,action,target_or_source,hits,attempts,damage,additional,skillchain,tp_before,tp_after,tp_delta,tp_class,note\n');
     file:flush();
     return true;
 end
@@ -670,6 +850,7 @@ local function write_log_event(event)
         event.attempts or '',
         event.damage or 0,
         event.add_damage or 0,
+        event.sc_damage or 0,
         event.tp_before or '',
         event.tp_after or '',
         event.tp_delta or '',
@@ -694,6 +875,10 @@ local function empty_stats()
         magic_damage = 0,
         ability_damage = 0,
         add_damage = 0,
+        skillchain_damage = 0,
+        skillchain_solo_damage = 0,
+        skillchain_shared_damage = 0,
+        skillchain_unknown_damage = 0,
         melee_rounds = 0,
         melee_attempts = 0,
         melee_hits = 0,
@@ -701,6 +886,8 @@ local function empty_stats()
         ranged_attempts = 0,
         ranged_hits = 0,
         ws_count = 0,
+        ws_attempts = 0,
+        ws_hits = 0,
         ability_count = 0,
     };
 end
@@ -752,6 +939,8 @@ local function reset_group_capture()
     state.group.last_poll = 0;
     state.group.elapsed = 0;
     state.group.started = state.group.enabled[1] and now() or nil;
+    state.group.shared_sc_damage = 0;
+    state.group.unknown_sc_damage = 0;
     refresh_group_members(true);
     poll_group_tp(true);
 end
@@ -780,10 +969,21 @@ local function self_generated_tp()
 end
 
 local function accuracy()
-    local attempts = state.stats.melee_attempts + state.stats.ranged_attempts;
-    local hits = state.stats.melee_hits + state.stats.ranged_hits;
-    if attempts == 0 then return 0; end
-    return (hits / attempts) * 100;
+    local value = percent(state.stats.melee_hits + state.stats.ranged_hits,
+        state.stats.melee_attempts + state.stats.ranged_attempts);
+    return value or 0;
+end
+
+local function melee_accuracy()
+    return percent(state.stats.melee_hits, state.stats.melee_attempts);
+end
+
+local function ranged_accuracy()
+    return percent(state.stats.ranged_hits, state.stats.ranged_attempts);
+end
+
+local function ws_accuracy()
+    return percent(state.stats.ws_hits, state.stats.ws_attempts);
 end
 
 local function hits_per_round()
@@ -990,6 +1190,8 @@ local function record_self_action(action)
         end
     end
 
+    local sc_damage, solo_sc, shared_sc, unknown_sc, sc_text = skillchain_totals(action);
+
     if state.recording and state.benchmark.current and state.benchmark.current.target_lock then
         local current = state.benchmark.current;
         local self_id = get_player_id();
@@ -1019,6 +1221,7 @@ local function record_self_action(action)
     for k, _ in pairs(reactions) do table.insert(notes, k); end
     table.sort(notes);
     if category == 3 then table.insert(notes, 'preTP=' .. pre_tp_source); end
+    if sc_text ~= '' then table.insert(notes, 'SC=' .. sc_text); end
 
     local type_name = packets.category_name(category);
     local event = add_event({
@@ -1029,6 +1232,11 @@ local function record_self_action(action)
         hits = hits,
         damage = damage,
         add_damage = add_damage,
+        sc_damage = sc_damage,
+        sc_solo_damage = solo_sc,
+        sc_shared_damage = shared_sc,
+        sc_unknown_damage = unknown_sc,
+        sc_text = sc_text,
         tp_before = pre_tp,
         tp_before_source = pre_tp_source,
         tp_after = ws_post_tp,
@@ -1057,7 +1265,12 @@ local function record_self_action(action)
     local t = event.clock;
     if not state.stats.first_action then state.stats.first_action = t; end
     state.stats.last_action = t;
-    mark_activity(t);
+
+    -- Use offensive activity for the DPS clock. Incoming damage and support-only
+    -- actions no longer lengthen Live's denominator, keeping it comparable to Group.
+    if category == 1 or category == 2 or category == 3 or damage > 0 or add_damage > 0 or sc_damage > 0 then
+        mark_activity(t);
+    end
 
     if category == 1 then
         state.stats.melee_rounds = state.stats.melee_rounds + 1;
@@ -1074,6 +1287,8 @@ local function record_self_action(action)
         register_tp_candidate(event, 'ranged');
     elseif category == 3 then
         state.stats.ws_count = state.stats.ws_count + 1;
+        state.stats.ws_attempts = state.stats.ws_attempts + attempts;
+        state.stats.ws_hits = state.stats.ws_hits + hits;
         state.stats.ws_damage = state.stats.ws_damage + damage;
         update_ws(event);
         register_tp_candidate(event, 'ws');
@@ -1086,7 +1301,16 @@ local function record_self_action(action)
     end
 
     state.stats.add_damage = state.stats.add_damage + add_damage;
-    state.stats.total_damage = state.stats.melee_damage + state.stats.ranged_damage + state.stats.ws_damage + state.stats.magic_damage + state.stats.ability_damage + state.stats.add_damage;
+    state.stats.skillchain_damage = state.stats.skillchain_damage + sc_damage;
+    state.stats.skillchain_solo_damage = state.stats.skillchain_solo_damage + solo_sc;
+    state.stats.skillchain_shared_damage = state.stats.skillchain_shared_damage + shared_sc;
+    state.stats.skillchain_unknown_damage = state.stats.skillchain_unknown_damage + unknown_sc;
+
+    -- Only confidently self-created SC damage is credited to the local player's DPS.
+    -- Shared / unknown SC remains visible on Damage/Group without being assigned to a player.
+    state.stats.total_damage = state.stats.melee_damage + state.stats.ranged_damage + state.stats.ws_damage
+        + state.stats.magic_damage + state.stats.ability_damage + state.stats.add_damage
+        + state.stats.skillchain_solo_damage;
 end
 
 local function record_incoming_action(action)
@@ -1155,7 +1379,8 @@ local function record_incoming_action(action)
     });
 
     if damage > 0 or add_damage > 0 then
-        mark_activity(event.clock);
+        -- Incoming hits can grant TP, but they should not lengthen the local
+        -- outgoing-DPS denominator used by Live / Compare.
         if category == 1 or category == 2 or category == 11 then
             register_tp_candidate(event, 'incoming');
         end
@@ -1433,7 +1658,8 @@ end
 local HISTORY_FIELDS = {
     'timestamp','date','time','job','sub_job','name','source','command','scope','target','target_mismatches','duration','active_seconds','tp_observable_seconds','tp_capped_seconds',
     'dps','total_damage','self_tpps','total_tpps','melee_tpps','ranged_tpps','accuracy','hits_per_round','melee_damage','ranged_damage','ws_damage',
-    'magic_damage','ability_damage','proc_damage','ws_count','avg_ws','avg_ws_tp','melee_rounds','ranged_shots','gear','gear_samples','integrity'
+    'magic_damage','ability_damage','proc_damage','ws_count','avg_ws','avg_ws_tp','melee_rounds','ranged_shots','gear','gear_samples','integrity',
+    'skillchain_damage','shared_skillchain_damage'
 };
 
 local function history_clean(value)
@@ -1510,6 +1736,7 @@ local NUMERIC_HISTORY_FIELDS = {
     timestamp=true,target_mismatches=true,duration=true,active_seconds=true,tp_observable_seconds=true,tp_capped_seconds=true,dps=true,total_damage=true,self_tpps=true,total_tpps=true,
     melee_tpps=true,ranged_tpps=true,accuracy=true,hits_per_round=true,melee_damage=true,ranged_damage=true,ws_damage=true,magic_damage=true,ability_damage=true,
     proc_damage=true,ws_count=true,avg_ws=true,avg_ws_tp=true,melee_rounds=true,ranged_shots=true,gear_samples=true,
+    skillchain_damage=true,shared_skillchain_damage=true,
 };
 
 local function load_history()
@@ -1612,6 +1839,8 @@ local function build_run_snapshot()
         magic_damage = state.stats.magic_damage or 0,
         ability_damage = state.stats.ability_damage or 0,
         proc_damage = state.stats.add_damage or 0,
+        skillchain_damage = state.stats.skillchain_solo_damage or 0,
+        shared_skillchain_damage = (state.stats.skillchain_shared_damage or 0) + (state.stats.skillchain_unknown_damage or 0),
         ws_count = state.stats.ws_count or 0,
         avg_ws = avg_ws,
         avg_ws_tp = avg_ws_tp,
@@ -1743,7 +1972,9 @@ local function draw_live_tab()
         row3('Melee TP/sec', string.format('%.1f', tp_rate(state.tp.melee)), 'self melee');
         row3('Ranged TP/sec', string.format('%.1f', tp_rate(state.tp.ranged)), 'self ranged');
         row3('Incoming TP', state.tp.incoming, 'damage taken');
-        row3('Accuracy', string.format('%.1f%%', accuracy()), 'melee+ranged');
+        row3('Accuracy', string.format('%.1f%%', accuracy()), 'melee + ranged');
+        row3('Solo SC damage', state.stats.skillchain_solo_damage or 0, 'credited to DPS');
+        row3('Shared / unknown SC', (state.stats.skillchain_shared_damage or 0) + (state.stats.skillchain_unknown_damage or 0), 'shown, not player-credited');
         row3('Landed hits / melee round', string.format('%.2f', hits_per_round()), '0x028');
         row3('Melee rounds', state.stats.melee_rounds, '0x028');
         row3('Ranged shots', state.stats.ranged_shots, '0x028');
@@ -1768,14 +1999,15 @@ local function draw_live_tab()
         imgui.TextColored({ 0.60, 0.60, 0.60, 1.00 }, '(raw TP rows hidden)');
     end
 
-    if imgui.BeginTable('##event_table', 9, 0) then
+    if imgui.BeginTable('##event_table', 10, 0) then
         imgui.TableSetupColumn('Elapsed');
         imgui.TableSetupColumn('Type');
         imgui.TableSetupColumn('Action');
         imgui.TableSetupColumn('Target / Source');
         imgui.TableSetupColumn('Hit/A');
         imgui.TableSetupColumn('Dmg');
-        imgui.TableSetupColumn('Add');
+        imgui.TableSetupColumn('Proc');
+        imgui.TableSetupColumn('SC');
         imgui.TableSetupColumn('TP');
         imgui.TableSetupColumn('TP Src');
         imgui.TableHeadersRow();
@@ -1794,6 +2026,7 @@ local function draw_live_tab()
                 if (e.attempts or 0) > 0 then imgui.Text(string.format('%d/%d', e.hits or 0, e.attempts or 0)); else imgui.Text('--'); end
                 imgui.TableNextColumn(); imgui.Text(tostring(e.damage or 0));
                 imgui.TableNextColumn(); imgui.Text((e.add_damage or 0) > 0 and tostring(e.add_damage) or '--');
+                imgui.TableNextColumn(); imgui.Text((e.sc_damage or 0) > 0 and (e.sc_text ~= '' and e.sc_text or tostring(e.sc_damage)) or '--');
                 imgui.TableNextColumn(); imgui.Text(event_tp_text(e));
                 imgui.TableNextColumn(); imgui.Text((e.tp_class and e.tp_class ~= '') and e.tp_class or '--');
                 shown = shown + 1;
@@ -1806,8 +2039,8 @@ end
 
 local function draw_group_tab()
     header('Group Parser');
-    imgui.Text('Current party/alliance damage with per-player active DPS and observed TP/sec.');
-    imgui.TextColored({ 0.60, 0.60, 0.60, 1.00 }, 'TP/s is observational for other players: all positive visible TP gains divided by TP-observable active time.');
+    imgui.Text('Party/alliance damage, physical accuracy, observed TP/sec, and skillchain attribution.');
+    muted('Accuracy is melee + ranged only, matching the Live tab. Solo SC is credited to its player; shared SC stays separate.');
     imgui.Text('Status: ' .. (state.group.enabled[1] and 'CAPTURING' or 'STOPPED / FROZEN') .. ' | Capture ' .. format_elapsed(group_elapsed()));
     if imgui.Button('Start Group') then start_group_capture(); end
     imgui.SameLine();
@@ -1824,14 +2057,16 @@ local function draw_group_tab()
         return;
     end
 
-    if imgui.BeginTable('##group_parser', 10, 0) then
+    if imgui.BeginTable('##group_parser', 12, 0) then
         imgui.TableSetupColumn('Player');
+        imgui.TableSetupColumn('Acc');
         imgui.TableSetupColumn('Melee');
         imgui.TableSetupColumn('Range');
         imgui.TableSetupColumn('Magic');
         imgui.TableSetupColumn('Ability');
         imgui.TableSetupColumn('Proc');
         imgui.TableSetupColumn('WS');
+        imgui.TableSetupColumn('SC');
         imgui.TableSetupColumn('TP/s');
         imgui.TableSetupColumn('Total');
         imgui.TableSetupColumn('DPS');
@@ -1842,32 +2077,87 @@ local function draw_group_tab()
             if member and member.present then
                 local tpps = group_member_tpps(member);
                 local member_dps = group_member_dps(member);
+                local member_acc = group_member_accuracy(member);
                 local tp_text = '--';
                 if tpps then
                     tp_text = string.format('%.1f%s', tpps, (member.tp_capped_seconds or 0) > 0 and '*' or '');
                 end
                 local dps_text = member_dps and string.format('%.1f', member_dps) or '--';
+                local acc_text = member_acc and string.format('%.1f%%', member_acc) or '--';
 
                 imgui.TableNextRow();
                 imgui.TableNextColumn(); imgui.Text(member.name or '--');
+                imgui.TableNextColumn(); imgui.Text(acc_text);
                 imgui.TableNextColumn(); imgui.Text(tostring(member.melee or 0));
                 imgui.TableNextColumn(); imgui.Text(tostring(member.ranged or 0));
                 imgui.TableNextColumn(); imgui.Text(tostring(member.magic or 0));
                 imgui.TableNextColumn(); imgui.Text(tostring(member.ability or 0));
                 imgui.TableNextColumn(); imgui.Text(tostring(member.proc or 0));
                 imgui.TableNextColumn(); imgui.Text(tostring(member.ws or 0));
+                imgui.TableNextColumn(); imgui.Text(tostring(member.skillchain or 0));
                 imgui.TableNextColumn(); imgui.Text(tp_text);
                 imgui.TableNextColumn(); imgui.Text(tostring(member.total or 0));
                 imgui.TableNextColumn(); imgui.Text(dps_text);
             end
         end
+
+        if (state.group.shared_sc_damage or 0) > 0 then
+            imgui.TableNextRow();
+            imgui.TableNextColumn(); imgui.TextColored(GAIA.gold, 'Shared SC');
+            imgui.TableNextColumn(); imgui.Text('--');
+            for _ = 1, 6 do imgui.TableNextColumn(); imgui.Text('--'); end
+            imgui.TableNextColumn(); imgui.TextColored(GAIA.gold, tostring(state.group.shared_sc_damage or 0));
+            imgui.TableNextColumn(); imgui.Text('--');
+            imgui.TableNextColumn(); imgui.Text(tostring(state.group.shared_sc_damage or 0));
+            imgui.TableNextColumn(); imgui.Text('--');
+        end
+
+        if (state.group.unknown_sc_damage or 0) > 0 then
+            imgui.TableNextRow();
+            imgui.TableNextColumn(); imgui.TextColored(GAIA.muted, 'Unresolved SC');
+            imgui.TableNextColumn(); imgui.Text('--');
+            for _ = 1, 6 do imgui.TableNextColumn(); imgui.Text('--'); end
+            imgui.TableNextColumn(); imgui.TextColored(GAIA.muted, tostring(state.group.unknown_sc_damage or 0));
+            imgui.TableNextColumn(); imgui.Text('--');
+            imgui.TableNextColumn(); imgui.Text(tostring(state.group.unknown_sc_damage or 0));
+            imgui.TableNextColumn(); imgui.Text('--');
+        end
         imgui.EndTable();
     end
 
     imgui.Separator();
-    imgui.Text(string.format('Members present: %d | Group action packets: %d', #state.group.order, state.debug.group_action_packets or 0));
-    imgui.TextWrapped('* TP/s with an asterisk had some active time censored while that player was observed at 3000 TP. Negative TP deltas (for example WS spending) are not subtracted from observed TP gain.');
-    imgui.TextWrapped('Total and DPS currently cover the displayed damage buckets only: Melee + Range + Magic + Ability + Proc + WS. Skillchain damage is not separated yet.');
+    header('Live vs Group - You');
+    local self_member = state.group.members[get_player_id()];
+    if self_member then
+        local gdps = group_member_dps(self_member);
+        local live_dps = dps();
+        local damage_delta = (state.stats.total_damage or 0) - (self_member.total or 0);
+        local time_delta = active_time() - (self_member.active_seconds or 0);
+        local dps_delta = gdps and (live_dps - gdps) or nil;
+        imgui.Text(string.format('Damage: Live %d | Group %d | Delta %+d', state.stats.total_damage or 0, self_member.total or 0, damage_delta));
+        if gdps then
+            imgui.Text(string.format('DPS:    Live %.1f | Group %.1f | Delta %+.1f', live_dps, gdps, dps_delta));
+        else
+            imgui.Text(string.format('DPS:    Live %.1f | Group --', live_dps));
+        end
+        imgui.Text(string.format('Active: Live %.2fs | Group %.2fs | Delta %+.2fs', active_time(), self_member.active_seconds or 0, time_delta));
+        imgui.Text(string.format('Capture elapsed: Live %s | Group %s', format_elapsed(live_elapsed()), format_elapsed(group_elapsed())));
+        if math.abs(damage_delta) <= 0.5 and math.abs(time_delta) <= 0.05 then
+            good('Live and Group self totals are aligned for the current capture window.');
+        elseif math.abs(damage_delta) <= 0.5 then
+            warn('Damage matches; the DPS delta is denominator/timing related.');
+        else
+            warn('Damage differs too. Check whether Live and Group were reset/started at different times, or review the event buckets above.');
+        end
+    else
+        muted('Your local Group row is not currently available.');
+    end
+
+    imgui.Separator();
+    imgui.Text(string.format('Members present: %d | Group action packets: %d | Shared SC: %d | Unresolved SC: %d',
+        #state.group.order, state.debug.group_action_packets or 0, state.group.shared_sc_damage or 0, state.group.unknown_sc_damage or 0));
+    muted('* TP/s with an asterisk had active time censored while that player was observed at 3000 TP. Negative TP deltas are not subtracted.');
+    muted('SC ownership is inferred from the prior landed weapon skill on the same target. If the opener cannot be identified confidently, the damage is kept as Unresolved SC instead of being assigned to a player.');
 end
 
 local function draw_test_lab_tab()
@@ -2030,6 +2320,8 @@ local function draw_compare_tab()
         compare_row('Magic damage', a.magic_damage, b.magic_damage, 0);
         compare_row('Ability damage', a.ability_damage, b.ability_damage, 0);
         compare_row('Proc damage', a.proc_damage, b.proc_damage, 0);
+        compare_row('Solo skillchain damage', a.skillchain_damage, b.skillchain_damage, 0);
+        compare_row('Shared / unknown SC', a.shared_skillchain_damage, b.shared_skillchain_damage, 0);
         compare_row('Active seconds', a.active_seconds, b.active_seconds, 1);
         imgui.EndTable();
     end
@@ -2098,23 +2390,54 @@ local function draw_tp_tab()
     imgui.TextWrapped('Positive TP changes are matched to the closest recent self melee/ranged/WS/ability action or incoming damaging action. Raw TP rows are retained internally and can be shown from Settings.');
 end
 
+local function damage_accuracy_row(label, damage, hits, attempts, accuracy_value)
+    imgui.TableNextRow();
+    imgui.TableNextColumn(); imgui.Text(label);
+    imgui.TableNextColumn(); imgui.Text(tostring(damage or 0));
+    imgui.TableNextColumn(); imgui.Text(hits ~= nil and tostring(hits) or '--');
+    imgui.TableNextColumn(); imgui.Text(attempts ~= nil and tostring(attempts) or '--');
+    imgui.TableNextColumn(); imgui.Text(accuracy_value and string.format('%.1f%%', accuracy_value) or '--');
+end
+
 local function draw_damage_tab()
-    header('Real Damage Breakdown');
-    if imgui.BeginTable('##damage_table', 2, 0) then
+    header('Damage & Accuracy');
+    imgui.Text('Damage sources are separated from hit-rate measurements so misses and skillchain damage are easier to audit.');
+    muted('Physical accuracy is packet-observed. Magic/ability rows do not claim an accuracy value because resist/land semantics are different.');
+
+    if imgui.BeginTable('##damage_table', 5, 0) then
         imgui.TableSetupColumn('Source');
         imgui.TableSetupColumn('Damage');
+        imgui.TableSetupColumn('Hits');
+        imgui.TableSetupColumn('Attempts');
+        imgui.TableSetupColumn('Accuracy');
         imgui.TableHeadersRow();
-        imgui.TableNextRow(); imgui.TableNextColumn(); imgui.Text('Melee'); imgui.TableNextColumn(); imgui.Text(tostring(state.stats.melee_damage));
-        imgui.TableNextRow(); imgui.TableNextColumn(); imgui.Text('Ranged'); imgui.TableNextColumn(); imgui.Text(tostring(state.stats.ranged_damage));
-        imgui.TableNextRow(); imgui.TableNextColumn(); imgui.Text('Weaponskills'); imgui.TableNextColumn(); imgui.Text(tostring(state.stats.ws_damage));
-        imgui.TableNextRow(); imgui.TableNextColumn(); imgui.Text('Magic'); imgui.TableNextColumn(); imgui.Text(tostring(state.stats.magic_damage));
-        imgui.TableNextRow(); imgui.TableNextColumn(); imgui.Text('Abilities'); imgui.TableNextColumn(); imgui.Text(tostring(state.stats.ability_damage));
-        imgui.TableNextRow(); imgui.TableNextColumn(); imgui.Text('Additional / proc'); imgui.TableNextColumn(); imgui.Text(tostring(state.stats.add_damage));
-        imgui.TableNextRow(); imgui.TableNextColumn(); imgui.Text('Total dealt'); imgui.TableNextColumn(); imgui.Text(tostring(state.stats.total_damage));
+
+        damage_accuracy_row('Melee', state.stats.melee_damage, state.stats.melee_hits, state.stats.melee_attempts, melee_accuracy());
+        damage_accuracy_row('Ranged', state.stats.ranged_damage, state.stats.ranged_hits, state.stats.ranged_attempts, ranged_accuracy());
+        damage_accuracy_row('Weaponskills', state.stats.ws_damage, state.stats.ws_hits, state.stats.ws_attempts, ws_accuracy());
+        damage_accuracy_row('Magic', state.stats.magic_damage, nil, nil, nil);
+        damage_accuracy_row('Abilities', state.stats.ability_damage, nil, nil, nil);
+        damage_accuracy_row('Additional / proc', state.stats.add_damage, nil, nil, nil);
+        damage_accuracy_row('Skillchain - Solo', state.stats.skillchain_solo_damage, nil, nil, nil);
+        damage_accuracy_row('Skillchain - Shared', state.stats.skillchain_shared_damage, nil, nil, nil);
+        damage_accuracy_row('Skillchain - Unresolved', state.stats.skillchain_unknown_damage, nil, nil, nil);
+
+        imgui.TableNextRow();
+        imgui.TableNextColumn(); imgui.TextColored(GAIA.gold, 'Total credited');
+        imgui.TableNextColumn(); imgui.TextColored(GAIA.gold, tostring(state.stats.total_damage or 0));
+        imgui.TableNextColumn(); imgui.Text('--');
+        imgui.TableNextColumn(); imgui.Text('--');
+        imgui.TableNextColumn(); imgui.Text(string.format('%.1f%% overall', accuracy()));
         imgui.EndTable();
     end
+
     imgui.Separator();
-    imgui.TextWrapped('Incoming damage is shown in the Live event feed for TP attribution, but is not included in player DPS totals.');
+    local uncredited_sc = (state.stats.skillchain_shared_damage or 0) + (state.stats.skillchain_unknown_damage or 0);
+    local observed_total = (state.stats.total_damage or 0) + uncredited_sc;
+    imgui.Text(string.format('Credited DPS total: %d | Shared/unresolved SC: %d | All observed damage: %d',
+        state.stats.total_damage or 0, uncredited_sc, observed_total));
+    good('Solo/self-created skillchain damage is included in your Total and DPS.');
+    muted('Shared and unresolved skillchain damage stays visible but is not assigned to one player. Incoming damage is never included in player DPS totals.');
 end
 
 local function draw_ws_tab()
@@ -2234,10 +2557,11 @@ local function draw_history_tab()
 end
 
 local function draw_settings_tab()
-    header('v0.5.2 Settings / Diagnostics');
+    header('v0.6.0 Settings / Diagnostics');
     imgui.Checkbox('Show compact HUD', state.show_hud);
     imgui.Text('Live capture: ' .. (state.live.enabled[1] and 'ON' or 'OFF') .. ' | Group capture: ' .. (state.group.enabled[1] and 'ON' or 'OFF'));
-    imgui.TextColored({ 0.60, 0.60, 0.60, 1.00 }, 'Use Start / Stop / Reset controls on the Live and Group tabs. Both parsers default to ON when the addon loads.');
+    muted('Use Start / Stop / Reset controls on the Live and Group tabs. Both parsers default to ON when the addon loads.');
+    good('Gaia theme is active for the DPSLab windows.');
 
     local raw_tp = T{ state.settings.show_raw_tp_events == true };
     if imgui.Checkbox('Show raw TP update rows in Live feed', raw_tp) then
@@ -2262,7 +2586,7 @@ local function draw_settings_tab()
         if state.log.error ~= '' then warn(state.log.error); end
         imgui.Text(string.format('Lines written this feed: %d', state.log.lines or 0));
     else
-        imgui.TextColored({ 0.60, 0.60, 0.60, 1.00 }, 'Logging is off.');
+        muted('Logging is off.');
     end
 
     imgui.Separator();
@@ -2282,14 +2606,17 @@ end
 local function draw_main_window()
     if not state.main_open[1] then return; end
 
-    imgui.SetNextWindowSizeConstraints({ 700, 420 }, { 1600, 1100 });
-    if imgui.Begin('DPSLab - Instrumentation v0.5.2', state.main_open) then
+    push_gaia_theme();
+    imgui.SetNextWindowSizeConstraints({ 820, 460 }, { 1800, 1150 });
+    if imgui.Begin('DPSLab - Gaia Combat Lab', state.main_open) then
+        imgui.TextColored(GAIA.gold, 'GAIA DPSLAB');
+        imgui.SameLine();
         imgui.Text('v' .. addon.version);
         imgui.SameLine();
         if state.recording then
-            imgui.TextColored({ 0.95, 0.25, 0.25, 1.00 }, 'RECORDING ' .. state.run_label);
+            imgui.TextColored(GAIA.red, 'RECORDING ' .. state.run_label);
         else
-            imgui.TextColored({ 0.60, 0.60, 0.60, 1.00 }, string.format('Live:%s Group:%s', state.live.enabled[1] and 'ON' or 'OFF', state.group.enabled[1] and 'ON' or 'OFF'));
+            imgui.TextColored(GAIA.muted, string.format('Live:%s Group:%s', state.live.enabled[1] and 'ON' or 'OFF', state.group.enabled[1] and 'ON' or 'OFF'));
         end
         imgui.SameLine();
         imgui.Text(string.format('| TP: %d', get_current_tp()));
@@ -2309,6 +2636,7 @@ local function draw_main_window()
         end
     end
     imgui.End();
+    pop_gaia_theme();
 end
 
 local function last_combat_event()
@@ -2322,11 +2650,12 @@ end
 local function draw_hud()
     if not state.show_hud[1] or not state.hud_open[1] then return; end
 
+    push_gaia_theme();
     if imgui.Begin('DPSLab HUD', state.hud_open, ImGuiWindowFlags_AlwaysAutoResize) then
         if state.recording then
-            imgui.TextColored({ 0.95, 0.25, 0.25, 1.00 }, '[REC] ' .. state.run_label);
+            imgui.TextColored(GAIA.red, '[REC] ' .. state.run_label);
         else
-            imgui.TextColored({ 0.40, 0.80, 0.95, 1.00 }, state.live.enabled[1] and '[LIVE CAPTURE]' or '[LIVE STOPPED]');
+            imgui.TextColored(state.live.enabled[1] and GAIA.teal or GAIA.muted, state.live.enabled[1] and '[LIVE CAPTURE]' or '[LIVE STOPPED]');
         end
         imgui.Text(string.format('DPS      %7.1f   SelfTP/s  %7.1f', dps(), tp_rate(self_generated_tp())));
         imgui.Text(string.format('Hit      %6.1f%%   MeleeTP/s %7.1f', accuracy(), tp_rate(state.tp.melee)));
@@ -2336,13 +2665,15 @@ local function draw_hud()
         local e = last_combat_event();
         if e then
             local tp_text = e.tp_delta and string.format(' / TP %+d', e.tp_delta) or '';
-            local add_text = (e.add_damage or 0) > 0 and string.format(' / Add %d', e.add_damage) or '';
-            imgui.Text(string.format('Last: %s %s | %d dmg%s%s', e.type, e.action, e.damage or 0, add_text, tp_text));
+            local add_text = (e.add_damage or 0) > 0 and string.format(' / Proc %d', e.add_damage) or '';
+            local sc_text = (e.sc_damage or 0) > 0 and string.format(' / SC %d', e.sc_damage) or '';
+            imgui.Text(string.format('Last: %s %s | %d dmg%s%s%s', e.type, e.action, e.damage or 0, add_text, sc_text, tp_text));
         else
             imgui.Text('Last: --');
         end
     end
     imgui.End();
+    pop_gaia_theme();
 end
 
 local function print_help()
@@ -2446,7 +2777,7 @@ ashita.events.register('load', 'dpslab_load_cb', function ()
     reset_all_capture();
     load_history();
     if state.settings.log_self_events then open_log(); end
-    print(chat.header(addon.name):append(chat.message('Loaded v0.5.2 with safe A/B switching, Compare reset, History load confirmation, and History deletion.')));
+    print(chat.header(addon.name):append(chat.message('Loaded v0.6.0 with Gaia UI, damage accuracy, skillchain attribution, Group accuracy, and Live/Group delta diagnostics.')));
 end);
 
 ashita.events.register('unload', 'dpslab_unload_cb', function ()
@@ -2520,6 +2851,10 @@ ashita.events.register('packet_in', 'dpslab_packet_in_cb', function (e)
             return;
         end
 
+        -- Classify any SC result before either parser consumes the action.  The
+        -- opener tracker is updated only after both domains see the same snapshot.
+        action.skillchains = classify_skillchains(action);
+
         if state.group.enabled[1] then record_group_action(action); end
 
         if state.live.enabled[1] then
@@ -2531,6 +2866,8 @@ ashita.events.register('packet_in', 'dpslab_packet_in_cb', function (e)
                 record_incoming_action(action);
             end
         end
+
+        update_skillchain_tracker(action);
 
     elseif e.id == 0x0C8 or e.id == 0x0DD then
         state.group.last_refresh = 0;

@@ -1,3 +1,18 @@
+DPSLab v0.6.0-alpha
+===================
+- Added Gaia-inspired dark teal / gold styling to the main window and HUD.
+- Damage tab now shows hits, attempts, and accuracy for melee, ranged, and weaponskills.
+- Added Group Acc column using melee + ranged hit rate to match Live Accuracy.
+- Added skillchain detection from 0x028 additional-effect messages.
+- Added separate solo, shared, and unresolved skillchain buckets.
+- Solo/self-created WS skillchains are credited to the player's Total / DPS.
+- Shared skillchains are kept outside individual player totals and shown as a separate Group row.
+- Unresolved skillchains are preserved separately rather than guessed.
+- Added SC information to the Live event feed, compact HUD, ParserLogs, Compare, and benchmark History.
+- Added Live-vs-Group self diagnostic with damage, DPS, active-time, and capture-window deltas.
+- Aligned Live and Group DPS timing by preventing incoming damage and support-only actions from extending only the Live active-time denominator.
+- Retains all v0.5.2 Compare / History / safe A-B switching behavior.
+
 DPSLab v0.5.2-alpha
 ===================
 - Added Reset Compare button to clear loaded/frozen A and B comparison slots without affecting History.

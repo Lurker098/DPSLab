@@ -1,10 +1,15 @@
-DPSLab v0.5.2-alpha
+DPSLab v0.6.0-alpha
 
-NEW IN v0.5.2
-- Reset Compare clears loaded A/B comparison slots.
-- History confirms which selected run was loaded into Compare A/B.
-- Starting the opposite A/B test automatically saves the active run first.
-- Selected History runs can be deleted with confirmation.
+NEW IN v0.6.0
+- Gaia-inspired dark teal / gold UI theme for the main window and compact HUD.
+- Damage tab now shows Melee, Ranged, and WS hits / attempts / accuracy.
+- Group adds per-player physical accuracy (melee + ranged).
+- Skillchain damage is detected from 0x028 additional-effect messages and shown as its own damage bucket.
+- Solo/self-created WS skillchains are credited to the closing player's Total / DPS.
+- Shared skillchains are kept separate in Group rather than credited entirely to the closer.
+- Uncertain skillchain ownership is preserved as Unresolved SC rather than guessed.
+- Group now contains a Live-vs-Group self diagnostic showing damage, DPS, active-time, and capture-window deltas.
+- Live and Group use the same outgoing-combat active-time model for DPS, fixing the prior mismatch caused by support/incoming events extending only Live's denominator.
 ===================
 
 DPSLab is an Ashita v4 combat parser / benchmarking addon focused on controlled
@@ -38,6 +43,50 @@ Commands:
   /dpslab live start|stop|reset
   /dpslab group start|stop|reset
   /dpslab reset                  (resets both)
+
+DAMAGE + ACCURACY
+-----------------
+Damage now keeps separate buckets for:
+  Melee
+  Ranged
+  Weaponskills
+  Magic
+  Abilities
+  Additional / proc
+  Skillchain - Solo
+  Skillchain - Shared
+  Skillchain - Unresolved
+
+Melee, Ranged, and Weaponskills also show packet-observed hits, attempts, and
+hit rate. Group's Acc column intentionally uses melee + ranged only so it matches
+the Live-tab Accuracy metric. Magic/ability rows do not claim an accuracy value
+because resist / land semantics are not equivalent to physical hit rate.
+
+SKILLCHAIN ATTRIBUTION
+----------------------
+Skillchain damage is read from the additional-effect portion of the incoming
+0x028 action packet. For weapon-skill chains, DPSLab tracks the immediately
+preceding landed WS on the same target:
+
+  same actor -> Solo SC -> credited to that player's Total / DPS
+  different actor -> Shared SC -> shown separately in Group
+  opener not confidently known -> Unresolved SC -> shown, not player-credited
+
+This is intentionally conservative. Magic / pet-generated chains can still be
+detected as skillchain damage, but their ownership may remain Unresolved until
+a stronger opener-tracking path is added.
+
+LIVE VS GROUP DIAGNOSTIC
+------------------------
+The Group tab includes a local-player comparison showing:
+  Live damage vs Group self damage
+  Live DPS vs Group self DPS
+  Live active seconds vs Group self active seconds
+  Live capture elapsed vs Group capture elapsed
+
+This is meant to make parser discrepancies auditable. Live and Group now both
+use outgoing offensive activity for their DPS denominator; incoming damage and
+support-only actions no longer lengthen only the Live DPS clock.
 
 TEST LAB - LAC COMMAND DISCOVERY
 --------------------------------
